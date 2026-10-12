@@ -4,6 +4,11 @@ All notable changes to capcut-cli are documented here. The format follows [Keep 
 
 ## [Unreleased]
 
+### Changed
+
+- `skills/capcut-edit/scripts/anim.sh` derives the effect-cache base per platform instead of hardcoding the macOS container path, which on Windows wrote a path the app cannot resolve into the animation material: `%LOCALAPPDATA%\CapCut\User Data\Cache\effect` (JianYing: `%LOCALAPPDATA%\JianyingPro\...`), the macOS container on darwin, `~/.local/share/CapCut/Cache/effect` elsewhere. `CAPCUT_EFFECT_CACHE` overrides all three.
+- `skills/capcut-edit/scripts/{ken-burns,stamp-cta,long-to-short}.sh` no longer assume they sit inside a `capcut-cli` checkout. They resolve the CLI by priority `$CAPCUT_CLI` → the repo build → an installed `node_modules/capcut-cli/dist/index.js` (walking up from the script) → `capcut-cli`/`capcut` on `PATH`, so the skill works when it is copied out of the repo. `SKILL.md` documents the resolution order, the two environment variables and the JianYing draft-store path.
+
 ## [0.29.0] — 2026-10-09
 
 ### Added
