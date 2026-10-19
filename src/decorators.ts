@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Draft, MaterialText, Segment } from "./draft.js";
-import { findMaterial, findSegment } from "./draft.js";
+import { findMaterial } from "./draft.js";
 import { findEnum, type Namespace, slugsFor } from "./enums.js";
+import { jianyingMaskField, MASK_FIELDS, type MaskFieldName, maskEntries } from "./mask-fields.js";
+import { requireSegment } from "./segment-lookup.js";
 import { storedTextLength, toStoredOffset } from "./text-offsets.js";
-import { atLeast } from "./version.js";
 
 const PROPERTY_MAP: Record<string, string> = {
   position_x: "KFTypePositionX",
@@ -334,8 +335,7 @@ export function addKeyframes(
   holdKeyframes: number;
 } {
   resolveEasing(easing); // fail fast even when every keyframe overrides it
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment as Segment & { common_keyframes?: unknown };
 
   if (!Array.isArray(seg.common_keyframes)) {
@@ -416,8 +416,7 @@ export function addTransition(
     const hint = namespace === "jianying" ? " --jianying" : "";
     throw new Error(`Unknown transition: ${slug}. Run 'capcut enums --transitions${hint}' for the full list.`);
   }
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
   draft.materials.transitions ??= [];
   const transitions = draft.materials.transitions;
@@ -471,18 +470,6 @@ export interface MaskOptions {
   field?: MaskFieldName; // explicit target array (--mask-field); default: auto
 }
 
-/** The three mask material array variants seen in the wild. */
-export type MaskFieldName = "masks" | "common_mask" | "common_masks";
-
-// Priority newest-first: when consistency-following has to pick between
-// multiple populated variants, prefer the newest-era array.
-export const MASK_FIELDS: readonly MaskFieldName[] = ["common_masks", "common_mask", "masks"];
-
-function maskEntries(draft: Draft, field: MaskFieldName): Array<Record<string, unknown>> {
-  const arr = (draft.materials as Record<string, unknown>)[field];
-  return Array.isArray(arr) ? (arr as Array<Record<string, unknown>>) : [];
-}
-
 /**
  * Which materials array a new mask should be written into. Three variants
  * exist: `masks` (legacy JianYing 5.9 era), `common_masks` (JianYing 9.6+ —
@@ -500,7 +487,7 @@ export function maskTargetField(draft: Draft, override?: MaskFieldName): MaskFie
   if (override) return override;
   const source = draft.platform?.app_source;
   const version = draft.platform?.app_version ?? null;
-  if (source === "lv" && version) return atLeast(version, "9.6") ? "common_masks" : "masks";
+  if (source === "lv" && version) return jianyingMaskField(version);
   const populated = MASK_FIELDS.find((field) => maskEntries(draft, field).length > 0);
   if (populated) return populated;
   return source === "lv" ? "masks" : "common_mask";
@@ -518,8 +505,7 @@ export function addMask(
     const hint = namespace === "jianying" ? " --jianying" : "";
     throw new Error(`Unknown mask: ${slug}. Run 'capcut enums --masks${hint}' for the full list.`);
   }
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
 
   const field = maskTargetField(draft, opts.field);
@@ -584,8 +570,7 @@ export function setBgBlur(
   segmentId: string,
   level: 1 | 2 | 3 | 4 | "off",
 ): { segmentId: string; canvas_id: string | null; blur: number | null } {
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
 
   draft.materials.canvases ??= [] as Array<Record<string, unknown>>;
@@ -633,8 +618,7 @@ export function requireTextMaterial(
   segmentId: string,
   label?: string,
 ): { seg: Segment; text: MaterialText } {
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   if (label !== undefined && found.track.type !== "text") {
     throw new Error(`${label} only applies to text segments (track type: ${found.track.type})`);
   }
@@ -920,6 +904,58 @@ function ensureAnimContainer(draft: Draft, seg: Segment): { animations: Array<Re
   return fresh;
 }
 
+type PlacedAnimation = { type: string; name: string; duration_us: number; start_us: number };
+
+/**
+ * Put one animation into a segment's animation container. Each slot type
+ * (in / out / group) holds one animation per segment, an outro is anchored to
+ * the segment end, and the duration must fit the segment. The entry carries
+ * the fixed fields every CapCut material_animations entry has; the caller
+ * supplies what differs between video and text animations.
+ */
+function placeAnimation(
+  container: { animations: Array<Record<string, unknown>> },
+  targetDur: number,
+  anim: {
+    type: "in" | "out" | "group";
+    materialType: "video" | "text";
+    durationUs: number;
+    name: string;
+    effectId: string;
+    resourceId: string;
+    categoryId: string;
+    panel: string;
+    path: string;
+    thirdResourceId: string;
+  },
+): PlacedAnimation {
+  if (container.animations.some((a) => (a as { type: string }).type === anim.type)) {
+    throw new Error(`segment already has a ${anim.type} ${anim.materialType} animation`);
+  }
+  const dur = anim.durationUs;
+  if (dur > targetDur) throw new Error(`duration (${dur}us) exceeds segment duration (${targetDur}us)`);
+  const start = anim.type === "out" ? targetDur - dur : 0;
+  container.animations.push({
+    anim_adjust_params: null,
+    category_id: anim.categoryId,
+    category_name: anim.categoryId,
+    duration: dur,
+    id: anim.effectId,
+    material_type: anim.materialType,
+    name: anim.name,
+    panel: anim.panel,
+    path: anim.path,
+    platform: "all",
+    request_id: "",
+    resource_id: anim.resourceId,
+    source_platform: 1,
+    start,
+    third_resource_id: anim.thirdResourceId,
+    type: anim.type,
+  });
+  return { type: anim.type, name: anim.name, duration_us: dur, start_us: start };
+}
+
 export interface ImageAnimOptions {
   intro?: string;
   outro?: string;
@@ -943,13 +979,12 @@ export function addImageAnim(
     throw new Error("at least one of --intro, --outro, --combo is required");
   }
 
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
 
   const container = ensureAnimContainer(draft, seg);
 
-  const added: Array<{ type: string; name: string; duration_us: number; start_us: number }> = [];
+  const added: PlacedAnimation[] = [];
   const targetDur = seg.target_timerange.duration;
   const CACHE_BASE = `${process.env.HOME ?? ""}/Library/Containers/com.lemon.lvoverseas/Data/Movies/CapCut/User Data/Cache/effect`;
 
@@ -990,31 +1025,20 @@ export function addImageAnim(
       thirdResourceId = "0";
     }
 
-    if (container.animations.some((a) => (a as { type: string }).type === animType)) {
-      throw new Error(`segment already has a ${animType} video animation`);
-    }
-    const dur = overrideDur ?? defaultDur;
-    if (dur > targetDur) throw new Error(`duration (${dur}us) exceeds segment duration (${targetDur}us)`);
-    const start = animType === "out" ? targetDur - dur : 0;
-    container.animations.push({
-      anim_adjust_params: null,
-      category_id: categoryId,
-      category_name: categoryId,
-      duration: dur,
-      id: effectId,
-      material_type: "video",
-      name,
-      panel: "video",
-      path: md5 ? `${CACHE_BASE}/${effectId}/${md5}` : "",
-      platform: "all",
-      request_id: "",
-      resource_id: resourceId,
-      source_platform: 1,
-      start,
-      third_resource_id: thirdResourceId,
-      type: animType,
-    });
-    added.push({ type: animType, name, duration_us: dur, start_us: start });
+    added.push(
+      placeAnimation(container, targetDur, {
+        type: animType,
+        materialType: "video",
+        durationUs: overrideDur ?? defaultDur,
+        name,
+        effectId,
+        resourceId,
+        categoryId,
+        panel: "video",
+        path: md5 ? `${CACHE_BASE}/${effectId}/${md5}` : "",
+        thirdResourceId,
+      }),
+    );
   };
 
   if (opts.intro) addOne(opts.intro, opts.introDurationUs, "in");
@@ -1036,13 +1060,12 @@ export function addTextAnim(
 } {
   if (!opts.intro && !opts.outro) throw new Error("at least one of --intro or --outro is required");
 
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
 
   const container = ensureAnimContainer(draft, seg);
 
-  const added: Array<{ type: string; name: string; duration_us: number; start_us: number }> = [];
+  const added: PlacedAnimation[] = [];
   const targetDur = seg.target_timerange.duration;
 
   const addOne = (slug: string, overrideDur: number | undefined, animType: "in" | "out") => {
@@ -1054,33 +1077,20 @@ export function addTextAnim(
         `Unknown text ${animType === "in" ? "intro" : "outro"}: ${slug}. Run 'capcut enums --text-${animType === "in" ? "intros" : "outros"}${hint}' for the full list.`,
       );
     }
-    const name = meta.title ?? meta.name ?? slug;
-    if (container.animations.some((a) => (a as { type: string }).type === animType)) {
-      throw new Error(`segment already has a ${animType} text animation`);
-    }
-    const dur = overrideDur ?? meta.duration ?? meta.default_duration ?? 500000;
-    if (dur > targetDur) throw new Error(`duration (${dur}us) exceeds segment duration (${targetDur}us)`);
-    const start = animType === "out" ? targetDur - dur : 0;
-    const categoryId = animType === "in" ? "in_fav" : "out_fav";
-    container.animations.push({
-      anim_adjust_params: null,
-      category_id: categoryId,
-      category_name: categoryId,
-      duration: dur,
-      id: meta.effect_id,
-      material_type: "text",
-      name,
-      panel: "",
-      path: "",
-      platform: "all",
-      request_id: "",
-      resource_id: meta.resource_id,
-      source_platform: 1,
-      start,
-      third_resource_id: "",
-      type: animType,
-    });
-    added.push({ type: animType, name, duration_us: dur, start_us: start });
+    added.push(
+      placeAnimation(container, targetDur, {
+        type: animType,
+        materialType: "text",
+        durationUs: overrideDur ?? meta.duration ?? meta.default_duration ?? 500000,
+        name: meta.title ?? meta.name ?? slug,
+        effectId: meta.effect_id,
+        resourceId: meta.resource_id,
+        categoryId: animType === "in" ? "in_fav" : "out_fav",
+        panel: "",
+        path: "",
+        thirdResourceId: "",
+      }),
+    );
   };
 
   if (opts.intro) addOne(opts.intro, opts.introDurationUs, "in");

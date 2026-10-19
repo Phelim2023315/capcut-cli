@@ -1,12 +1,8 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
-  closeSync,
   existsSync,
-  fsyncSync,
-  linkSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -14,11 +10,12 @@ import {
   rmSync,
   unlinkSync,
   writeFileSync,
-  writeSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { appVersionEvidence, formatAppVersionDriftWarning, trackAppVersion } from "./app-versions.js";
+import { writeTemp } from "./atomic-write.js";
 import { stripBom } from "./bom.js";
+import { journalDigest } from "./journal-digest.js";
 import {
   assertActiveTimelineUnchanged,
   type DraftCandidate,
@@ -237,15 +234,10 @@ function snapshotFiles(filePath: string): string[] {
     .sort(); // zero-padded indices => lexicographic === numeric order, oldest first
 }
 
-// `source`, when given, is a file already holding exactly `content` — the
-// `.bak` written moments earlier from the same pre-write bytes. The snapshot
-// is then published as a second name for it instead of serializing the whole
-// draft to disk a second time, which on a large project is another
-// multi-megabyte write per target for bytes already on disk. The two names
-// never diverge afterwards: every writer here replaces a name by rename or
-// unlink, never edits a file in place, so the next write gives `.bak` a fresh
-// file and leaves this snapshot holding what it always held.
-function writeHistorySnapshot(filePath: string, content: string, source?: string, after?: string): void {
+// The snapshot is its own file, never a second name for `.bak`: the app
+// rewrites `<draft>.bak` in place when it saves (CapCut 9.5, issue #151), and
+// a hard link would carry that rewrite into the history the CLI restores from.
+function writeHistorySnapshot(filePath: string, content: string, after?: string): void {
   const dir = historyDir(filePath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const existing = snapshotFiles(filePath);
@@ -253,25 +245,14 @@ function writeHistorySnapshot(filePath: string, content: string, source?: string
   const lastIndex = last ? snapshotIndex(last) : 0;
   const name = `${basename(filePath)}.${String(lastIndex + 1).padStart(6, "0")}.snap`;
   const snapshot = join(dir, name);
-  let linked = false;
-  if (source !== undefined) {
-    try {
-      linkSync(source, snapshot);
-      linked = true;
-    } catch {
-      // Hard links are not universal — FAT/exFAT sticks and some network
-      // shares refuse them. Fall back to the full write so the snapshot is
-      // always there, whatever the draft folder is sitting on.
-    }
-  }
-  if (!linked) writeFileSync(snapshot, content, "utf-8");
+  writeFileSync(snapshot, content, "utf-8");
   appendJournal(filePath, {
     index: lastIndex + 1,
     time: new Date().toISOString(),
     command: writeContext.command,
     argv: writeContext.argv,
-    before_sha256: sha256(content),
-    after_sha256: after === undefined ? null : sha256(after),
+    before_sha256: journalDigest(content),
+    after_sha256: after === undefined ? null : journalDigest(after),
   });
   // Trim oldest beyond the cap.
   const all = snapshotFiles(filePath);
@@ -304,10 +285,6 @@ let writeContext: { command: string | null; argv: string[] | null } = { command:
 
 export function setWriteContext(command: string | null, argv: string[] | null): void {
   writeContext = { command, argv: argv === null ? null : [...argv] };
-}
-
-function sha256(content: string): string {
-  return createHash("sha256").update(content, "utf-8").digest("hex");
 }
 
 function snapshotIndex(name: string): number {
@@ -475,12 +452,10 @@ export function commitDraftTargets(
   try {
     for (const item of prepared) {
       if (options.backup !== false && item.target.raw !== null) {
-        // One write of the pre-write content, published under both recovery
-        // names: `.bak` (what `restore` reads) and the newest history snapshot
-        // (what `restore --step 1` reads).
-        const bak = `${item.target.path}.bak`;
-        writeAtomic(bak, item.target.raw);
-        writeHistorySnapshot(item.target.path, item.target.raw, bak, item.content);
+        // The pre-write content under both recovery names: `.bak` (what
+        // `restore` reads) and the newest history snapshot (`restore --step 1`).
+        writeAtomic(`${item.target.path}.bak`, item.target.raw);
+        writeHistorySnapshot(item.target.path, item.target.raw, item.content);
       }
     }
     for (const item of prepared) {
@@ -620,44 +595,6 @@ export function saveDraft(
       ? discoverDraftStore(filePath, { activeTimeline: store.activeTimeline?.explicit === true })
       : storeAfterWrite(store, draft, timelineWrites, options.preserveProjectFields),
   });
-}
-
-function writeAndSync(path: string, content: string): void {
-  // "wx" is O_CREAT|O_EXCL: it creates the file or fails, and never follows an
-  // existing symlink. See writeTemp for why that matters.
-  const fd = openSync(path, "wx", 0o600);
-  try {
-    writeSync(fd, content, undefined, "utf-8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/**
- * Create the scratch file a temp+fsync+rename write stages into, next to its
- * target, and return its path.
- *
- * The name carries crypto randomness and the open is exclusive. A predictable
- * name (pid + clock alone) is a write-through primitive: anyone able to create
- * files in the draft folder can pre-place a symlink at the path we are about
- * to open and redirect every draft save to a file of their choosing. O_EXCL is
- * the guarantee — it refuses a path that already exists, symlink included —
- * and the randomness keeps a legitimate concurrent writer from colliding with
- * us in the first place. A collision just draws another name; the bytes
- * written are unchanged.
- */
-function writeTemp(target: string, content: string): string {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const temp = `${target}.capcut-cli-${process.pid}-${Date.now()}-${randomBytes(8).toString("hex")}.tmp`;
-    try {
-      writeAndSync(temp, content);
-      return temp;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-  }
-  throw new Error(`Could not create a temp file next to ${target} after 8 attempts.`);
 }
 
 // Exported for factory.ts (register): the same temp+fsync+rename write the

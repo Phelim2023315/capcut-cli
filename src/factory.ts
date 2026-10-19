@@ -17,13 +17,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { stripBom } from "./bom.js";
-import { uuidHex } from "./decorators.js";
+import { readJsonObjectFile, readTextIfPresent, stripBom } from "./bom.js";
+import { hexToRgb01, uuidHex } from "./decorators.js";
 import { detectEncryption } from "./decrypt.js";
 import type { Draft, Segment, Timerange, Track } from "./draft.js";
 import { findMaterialGlobal, findSegment, loadedDraftProjectDir, makeTrack, writeAtomic } from "./draft.js";
 import { findEnum, type Namespace } from "./enums.js";
 import { PHOTO_META_DURATION_US, registerMediumInSidecar } from "./materials-register.js";
+import { requireSegment } from "./segment-lookup.js";
 import { isManagedDraftPath, parseCandidate } from "./store.js";
 import { storedTextLength } from "./text-offsets.js";
 import { atLeast, versionTuple } from "./version.js";
@@ -66,7 +67,24 @@ export function uuid(): string {
 
 // --- Asset copy (collision-safe) ---
 
+// Keep only the latest digest per absolute path, with a bound for long-lived
+// library callers. Metadata is checked on every use, including collision checks.
+const FILE_SHA1_CACHE_LIMIT = 256;
+const fileSha1Cache = new Map<string, { fingerprint: string; hash: string }>();
+
 function fileSha1(path: string): string {
+  const key = resolve(path);
+  const stat = statSync(key, { bigint: true });
+  // ctime and inode catch same-size rewrites/replacements even if mtime was
+  // restored. Nanosecond timestamps avoid discarding filesystem precision.
+  const fingerprint = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
+  const cached = fileSha1Cache.get(key);
+  if (cached?.fingerprint === fingerprint) {
+    // Refresh insertion order so frequently reused media survives eviction.
+    fileSha1Cache.delete(key);
+    fileSha1Cache.set(key, cached);
+    return cached.hash;
+  }
   const hash = createHash("sha1");
   const fd = openSync(path, "r");
   const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -76,7 +94,13 @@ function fileSha1(path: string): string {
       if (count === 0) break;
       hash.update(buffer.subarray(0, count));
     }
-    return hash.digest("hex");
+    const digest = hash.digest("hex");
+    fileSha1Cache.delete(key);
+    fileSha1Cache.set(key, { fingerprint, hash: digest });
+    if (fileSha1Cache.size > FILE_SHA1_CACHE_LIMIT) {
+      fileSha1Cache.delete(fileSha1Cache.keys().next().value!);
+    }
+    return digest;
   } finally {
     closeSync(fd);
   }
@@ -387,16 +411,6 @@ function seedOutranks(a: StoreSeed, b: StoreSeed): boolean {
   if (a.appAuthored !== b.appAuthored) return a.appAuthored;
   if (a.appVersion !== b.appVersion) return atLeast(a.appVersion, b.appVersion);
   return a.mtimeMs > b.mtimeMs;
-}
-
-/**
- * Newest `platform.app_version` across the drafts already in a drafts ROOT, or
- * null when the folder holds no readable draft. store.ts's highestVersion does
- * the same job across one project's siblings; `init` has no project to discover
- * yet, so it scans the store instead.
- */
-export function detectStoreAppVersion(draftsDir: string): string | null {
-  return scanStore(draftsDir).newestVersion;
 }
 
 /** True when the store's projects come from a materially newer app than the template declares (#67's gate). */
@@ -1055,17 +1069,8 @@ export function planDraftRegistration(
 
   // Target 1: the per-folder draft_meta_info.json sidecar.
   const metaPath = resolve(projectDir, "draft_meta_info.json");
-  const metaRaw = existsSync(metaPath) ? stripBom(readFileSync(metaPath, "utf-8")) : null;
-  let metaParsed: Record<string, unknown> | null = null;
-  if (metaRaw !== null) {
-    try {
-      const parsed = JSON.parse(metaRaw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
-        metaParsed = parsed as Record<string, unknown>;
-    } catch {
-      // Unparseable sidecar: metaParsed stays null and is treated as corrupt below.
-    }
-  }
+  // An unparseable sidecar leaves metaParsed null and is treated as corrupt below.
+  const { raw: metaRaw, obj: metaParsed } = readJsonObjectFile(metaPath);
   if (storeRoot === null) {
     // Without a known store root there is no draft_root_path to derive and no
     // index to update — report only, never write (the contract for drafts
@@ -1150,7 +1155,7 @@ export function planDraftRegistration(
 
     // Target 2: the draft's entry in the store's root_meta_info.json index.
     const indexPath = resolve(storeRoot, "root_meta_info.json");
-    const indexRaw = existsSync(indexPath) ? stripBom(readFileSync(indexPath, "utf-8")) : null;
+    const { raw: indexRaw, obj: index } = readJsonObjectFile(indexPath);
     if (indexRaw === null) {
       // No index yet (fresh CapCut / custom --drafts dir): create a minimal
       // one, exactly like init's registerDraftInIndex.
@@ -1169,13 +1174,7 @@ export function planDraftRegistration(
         previous: null,
       });
     } else {
-      let index: Record<string, unknown> | null = null;
-      try {
-        const parsed = JSON.parse(indexRaw) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) index = parsed as Record<string, unknown>;
-      } catch {
-        // Unreadable index — leave it untouched rather than corrupt it (it lists every draft).
-      }
+      // Unreadable index — leave it untouched rather than corrupt it (it lists every draft).
       if (index === null) {
         targets.push({
           file: "root_meta_info.json",
@@ -1271,6 +1270,25 @@ export function planDraftRegistration(
 }
 
 /**
+ * The sync-timelines optimistic-concurrency rule for register and rename:
+ * refuse when a planned file's text is no longer what the plan read
+ * (`previous`, null for a file that was absent).
+ */
+function assertPlannedFilesUnchanged(
+  writes: Array<{ file: string; path: string; previous: string | null }>,
+  command: "register" | "rename",
+): void {
+  for (const write of writes) {
+    if (readTextIfPresent(write.path) !== write.previous) {
+      throw new Error(
+        `Draft changed on disk after it was planned: ${write.file}. ` +
+          `Re-run ${command}, or pass --force-write to overwrite intentionally.`,
+      );
+    }
+  }
+}
+
+/**
  * Perform the writes a registration plan prepared: temp+fsync+rename per file,
  * with a `.bak` of the pre-plan content for every file that already existed.
  * Unless forceWrite, refuses when a target changed on disk between the plan
@@ -1280,17 +1298,7 @@ export function applyDraftRegistration(
   result: RegistrationResult,
   options: { forceWrite?: boolean } = {},
 ): { applied: string[]; backups: string[] } {
-  if (!options.forceWrite) {
-    for (const write of result.writes) {
-      const current = existsSync(write.path) ? stripBom(readFileSync(write.path, "utf-8")) : null;
-      if (current !== write.previous) {
-        throw new Error(
-          `Draft changed on disk after it was planned: ${write.file}. ` +
-            "Re-run register, or pass --force-write to overwrite intentionally.",
-        );
-      }
-    }
-  }
+  if (!options.forceWrite) assertPlannedFilesUnchanged(result.writes, "register");
   const applied: string[] = [];
   const backups: string[] = [];
   for (const write of result.writes) {
@@ -1437,22 +1445,12 @@ export function planDraftRename(
   // proceeding would leave the app a sidecar whose recorded name/paths can
   // never be updated. register --apply repairs it (with a .bak) first.
   const metaPath = resolve(projectDir, "draft_meta_info.json");
-  const metaRaw = existsSync(metaPath) ? stripBom(readFileSync(metaPath, "utf-8")) : null;
-  let metaParsed: Record<string, unknown> | null = null;
-  if (metaRaw !== null) {
-    try {
-      const parsed = JSON.parse(metaRaw) as unknown;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
-        metaParsed = parsed as Record<string, unknown>;
-    } catch {
-      // metaParsed stays null → refused below.
-    }
-    if (metaParsed === null) {
-      throw new Error(
-        "rename must update draft_meta_info.json but it does not parse as JSON. " +
-          `Repair it first — capcut register ${projectDir} --apply rewrites the sidecar with a .bak — then re-run rename.`,
-      );
-    }
+  const { raw: metaRaw, obj: metaParsed } = readJsonObjectFile(metaPath);
+  if (metaRaw !== null && metaParsed === null) {
+    throw new Error(
+      "rename must update draft_meta_info.json but it does not parse as JSON. " +
+        `Repair it first — capcut register ${projectDir} --apply rewrites the sidecar with a .bak — then re-run rename.`,
+    );
   }
 
   const oldName =
@@ -1511,7 +1509,7 @@ export function planDraftRename(
     });
   } else {
     const indexPath = resolve(storeRoot, "root_meta_info.json");
-    const indexRaw = existsSync(indexPath) ? stripBom(readFileSync(indexPath, "utf-8")) : null;
+    const { raw: indexRaw, obj: index } = readJsonObjectFile(indexPath);
     if (indexRaw === null) {
       targets.push({
         file: "root_meta_info.json",
@@ -1522,13 +1520,7 @@ export function planDraftRename(
         updated_fields: [],
       });
     } else {
-      let index: Record<string, unknown> | null = null;
-      try {
-        const parsed = JSON.parse(indexRaw) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) index = parsed as Record<string, unknown>;
-      } catch {
-        // Unreadable index — refused below rather than renamed around (it lists every draft).
-      }
+      // Unreadable index — refused below rather than renamed around (it lists every draft).
       if (index === null) {
         throw new Error(
           "rename must update the draft's entry in root_meta_info.json, but the index does not parse as JSON; " +
@@ -1619,15 +1611,10 @@ export function applyDraftRename(
 ): { renamed: boolean; applied: string[]; backups: string[] } {
   const { plan, writes } = result;
   if (!options.forceWrite) {
-    for (const write of writes) {
-      const current = existsSync(write.readPath) ? stripBom(readFileSync(write.readPath, "utf-8")) : null;
-      if (current !== write.previous) {
-        throw new Error(
-          `Draft changed on disk after it was planned: ${write.file}. ` +
-            "Re-run rename, or pass --force-write to overwrite intentionally.",
-        );
-      }
-    }
+    assertPlannedFilesUnchanged(
+      writes.map((write) => ({ ...write, path: write.readPath })),
+      "rename",
+    );
   }
   if (existsSync(plan.new_path)) {
     throw new Error(`Refusing to rename: the target folder already exists: ${plan.new_path}`);
@@ -1799,11 +1786,6 @@ export interface AddTextOptions {
   trackName?: string;
 }
 
-function hexToRgb(hex: string): [number, number, number] {
-  const h = hex.replace("#", "");
-  return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255];
-}
-
 function buildTextContent(text: string, fontSize: number, color: [number, number, number]): string {
   return JSON.stringify({
     styles: [
@@ -1916,7 +1898,7 @@ export function addText(
   const matId = uuid();
   const fontSize = opts.fontSize ?? 15;
   const color = opts.color ?? "#FFFFFF";
-  const rgb = hexToRgb(color);
+  const rgb = hexToRgb01(color);
   const alignment = opts.alignment ?? 1;
   const trackName = opts.trackName ?? "text";
 
@@ -2361,8 +2343,7 @@ export interface RemoveSegmentResult {
  * fresh init draft).
  */
 export function removeSegment(draft: Draft, segId: string, opts: RemoveSegmentOptions = {}): RemoveSegmentResult {
-  const found = findSegment(draft, segId);
-  if (!found) throw new Error(`Segment not found: ${segId}`);
+  const found = requireSegment(draft, segId);
   const { track, segment, index } = found;
   const durationBefore = draft.duration;
   const removedStart = segment.target_timerange.start;
@@ -2450,22 +2431,7 @@ export interface Template {
 }
 
 export function saveTemplate(draft: Draft, segId: string, name: string, outPath: string): Template {
-  const shortId = segId.toLowerCase();
-  let foundSeg: Segment | null = null;
-  let foundTrack: Track | null = null;
-
-  for (const track of draft.tracks) {
-    for (const seg of track.segments) {
-      if (seg.id === segId || seg.id.toLowerCase().startsWith(shortId)) {
-        foundSeg = seg;
-        foundTrack = track;
-        break;
-      }
-    }
-    if (foundSeg) break;
-  }
-
-  if (!foundSeg || !foundTrack) throw new Error(`Segment not found: ${segId}`);
+  const { segment: foundSeg, track: foundTrack } = requireSegment(draft, segId);
 
   // Resolve primary material
   const mat = findMaterialGlobal(draft, foundSeg.material_id);
@@ -2634,8 +2600,7 @@ export function duplicateSegment(
   segId: string,
   opts: DuplicateSegmentOptions = {},
 ): DuplicateSegmentResult {
-  const found = findSegment(draft, segId);
-  if (!found) throw new Error(`Segment not found: ${segId}`);
+  const found = requireSegment(draft, segId);
   const { track: sourceTrack, segment: sourceSeg } = found;
   const { start, duration } = sourceSeg.target_timerange;
 
@@ -2974,8 +2939,7 @@ export function addEffect(
   // full segment id so the written reference never dangles.
   let bindSegmentId = "";
   if (opts.bindSegmentId) {
-    const bound = findSegment(draft, opts.bindSegmentId);
-    if (!bound) throw new Error(`Segment not found: ${opts.bindSegmentId}`);
+    const bound = requireSegment(draft, opts.bindSegmentId);
     bindSegmentId = bound.segment.id;
   }
 
@@ -3100,8 +3064,7 @@ function findCropMaterial(
   segmentId: string,
   label = "crop",
 ): { seg: Segment; mat: Record<string, unknown> & { id: string; type?: string } } {
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   const seg = found.segment;
   const videos = (draft.materials.videos ?? []) as Array<Record<string, unknown> & { id: string; type?: string }>;
   const mat = videos.find((v) => v.id === seg.material_id);
@@ -3201,8 +3164,7 @@ export function setAudioFade(
   if (fadeIn <= 0 && fadeOut <= 0) {
     throw new Error(`audio-fade requires at least one of --in or --out (> 0)`);
   }
-  const found = findSegment(draft, segmentId);
-  if (!found) throw new Error(`Segment not found: ${segmentId}`);
+  const found = requireSegment(draft, segmentId);
   if (found.track.type !== "audio") {
     throw new Error(`audio-fade only applies to audio segments (track type: ${found.track.type})`);
   }

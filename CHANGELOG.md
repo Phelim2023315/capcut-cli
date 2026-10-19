@@ -11,8 +11,29 @@ All notable changes to capcut-cli are documented here. The format follows [Keep 
 
 ### Fixed
 
+- `compile`, `add-video` and `add-audio` reuse content hashes for unchanged media within a process instead of re-reading entire source and staged files for every segment (#155). Filename collisions still compare actual content; edits and file replacements invalidate the bounded cache, including same-size changes with a restored modification time.
+
 - `caption` and `doctor` resolve the Whisper binary through one resolver: an explicit `--whisper-cmd` first, then the first of `whisper` / `whisper-cli` / `faster-whisper` actually on `PATH`. `doctor` had always probed all three while `caption` only ever spawned `whisper` and defaulted its dialect to openai, so on a host that installs whisper.cpp — a `whisper-cli` binary and no `whisper`, the name that build has shipped since v1.7.4 — `doctor` reported the check as ok and the first `caption` run failed with ENOENT while hinting at the wrong dialect. Resolving also feeds dialect detection, so a resolved `whisper-cli` selects the whisper-cpp invocation instead of the openai one. `--whisper-cmd` and `--whisper-engine` still win.
 - `segments` no longer prints `NaN:00NaN` / `undefinedx` for a segment whose `target_timerange` omits `start` (its 0 default is simply not written) or that carries no `speed`. A draft that the app has edited can hold such a segment while the app itself shows it normally; `start_us`, `duration_us` and `speed` now fall back to `0`, `0` and `1` in the JSON result and in the `-H` tables.
+
+## [0.30.0] — 2026-10-16
+
+### Added
+
+- `capcut <command> --help`, `capcut <command> -h` and `capcut help <command>` print that command's usage, options, global options, output, prerequisites and exit codes, rendered from the same registry as `describe` and the command reference. Before, none of the 87 commands printed its own help: 79 read `--help` as an argument and failed (`add-text --help`: "No draft found at: --help"), and 8 ran instead (`doctor --help` ran the checks). `capcut help` alone, or an unknown command, prints the full help.
+- `restore --list` reports `integrity` per step: `intact` (the snapshot still matches the `before_sha256` the write journal recorded), `changed` (it was rewritten after the CLI saved it), or `unverified` (no journal entry). `restore` and `restore --step N` results carry the same field.
+- `caption --words` reads whisper.cpp full JSON (`whisper-cli -ojf`, `transcription[].tokens[]`) and reports `words_format: "whisper-cpp"`. Words are built from the tokens as in `caption --audio`; a segment whose tokens cannot be split into words stays one entry with its own timing.
+- `test/fixtures/jianying-9-0-0-windows/` — a real JianYing 9.0.0 (Windows) project captured after the app opened a tool-written draft: the plaintext `draft_info.json` primary alongside the `draft_content.json` / `template-2.tmp` / `draft_meta_info.json` mirrors the app rewrote into encrypted blobs, plus the materialised `Timelines/` layout. A regression test pins that the encrypted mirrors are reported as unparseable rather than breaking canonical selection, and `docs/version-support.md` gains a JianYing 9.0.0 (Windows) row (evidence: reported; storage shape fixture-backed). The write guard is deliberately unchanged — one machine's capture is not a round-trip claim.
+
+### Changed
+
+- With `--karaoke` or `--word-reveal`, `caption` runs whisper.cpp with `-ojf` and times each word from its tokens instead of splitting each segment evenly. A token that starts with a space opens a word and any other token (a sub-word piece, punctuation) continues it; in Chinese and Japanese every token is its own word. `[_BEG_]` / `[_TT_n]` tokens are skipped, a word stamped with zero length runs to the next word's start, and a segment whose tokens do not spell its text keeps the even split. Plain `-oj` output parses as before.
+- `translate` defaults to `claude-haiku-5-5` (was `claude-haiku-4-5-20251001`), with a 16,000-token response budget and low effort.
+
+### Fixed
+
+- `restore` no longer puts back the app's own save state after the app saved the project (#151). History snapshots were a second name (hard link) for `<draft>.bak`, which CapCut 9.5 rewrites in place when it saves; each snapshot is now its own file. `restore` and `restore --step N` check the file against the write journal first and refuse one that changed since the CLI wrote it with `refused [backup-changed]` / `refused [snapshot-changed]`; the `.bak` refusal points at `--step 1` when that snapshot is intact, and `--force-write` restores the file as it is. Snapshots written by earlier versions that still share bytes with a rewritten `.bak` list as `changed`.
+
 
 ## [0.29.0] — 2026-10-09
 
