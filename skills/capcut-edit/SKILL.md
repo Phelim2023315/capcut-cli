@@ -65,7 +65,7 @@ Batch is transactional: one failing operation writes nothing. Use `--continue-on
   - `_test.sh` — run every wrapper against the fixture; run after any change here.
 - **`assets/examples/`** — raw JSON snippets for hand-editing.
 
-Scripts resolve the `capcut` entry point themselves, so the skill also works when it is installed outside a `capcut-cli` checkout: `$CAPCUT_CLI` (explicit path to `dist/index.js`) wins, then the repo build, then an installed `node_modules/capcut-cli`, then `capcut-cli`/`capcut` on `PATH`. `anim.sh` resolves the CapCut effect-cache directory per platform; `$CAPCUT_EFFECT_CACHE` overrides it.
+Scripts resolve the `capcut` entry point themselves, so the skill also works when it is installed outside a `capcut-cli` checkout: `$CAPCUT_CLI` (explicit path to `dist/index.js` or a launcher) wins, then the repo build, then an installed `node_modules/capcut-cli`, then `capcut-cli`/`capcut` on `PATH`. A `.js` entry runs under `node`; a launcher (from `PATH`, or `$CAPCUT_CLI` pointing at one) runs directly. `anim.sh` resolves the CapCut effect-cache directory per platform; `$CAPCUT_EFFECT_CACHE` overrides it.
 
 ## Invariants
 
