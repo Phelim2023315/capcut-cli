@@ -65,7 +65,9 @@ function copySkillOutside(dir) {
 function envWithPath(dirs, extra = {}) {
   const env = { ...process.env, ...extra };
   delete env.CAPCUT_CLI;
-  env.PATH = [...dirs, env.PATH].join(delimiter);
+  // A plain object loses process.env's case-insensitive lookup on Windows.
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  env[pathKey] = [...dirs, env[pathKey] ?? ""].join(delimiter);
   return env;
 }
 
@@ -78,7 +80,7 @@ describe("skill scripts: CLI resolution", () => {
       tmp.cleanup();
     });
     const r = runKenBurns(fix.path, { CAPCUT_CLI: stubCli(tmp.dir), CAPCUT_CLI_APP_VERSIONS: join(tmp.dir, "v.json") });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     assert.ok(!/capcut CLI not found/.test(r.stderr), `unexpected resolution failure: ${r.stderr}`);
     const out = JSON.parse(r.stdout.trim().split("\n").pop());
     assert.equal(out.ok, true);
@@ -89,7 +91,7 @@ describe("skill scripts: CLI resolution", () => {
     const fix = tmpDraft();
     after(() => fix.cleanup());
     const r = runKenBurns(fix.path, { CAPCUT_CLI: join(fix.dir, "does-not-exist.js") });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     assert.ok(!/capcut CLI not found/.test(r.stderr));
     // The real CLI wrote the keyframes.
     const draft = JSON.parse(readFileSync(fix.path, "utf-8"));
@@ -107,7 +109,7 @@ describe("skill scripts: CLI resolution", () => {
     const env = { ...process.env, CAPCUT_CLI_APP_VERSIONS: join(tmp.dir, "v.json") };
     delete env.CAPCUT_CLI;
     const r = runKenBurns(fix.path, env);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     assert.ok(!/capcut CLI not found/.test(r.stderr));
   });
 
@@ -123,7 +125,7 @@ describe("skill scripts: CLI resolution", () => {
     stubLauncher(bin, "capcut-cli", stubCli(tmp.dir));
     const script = copySkillOutside(tmp.dir);
     const r = spawnSync("bash", KEN_BURNS_ARGS(fix.path, script), { encoding: "utf-8", env: envWithPath([bin]) });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout.trim().split("\n").pop());
     assert.deepEqual(out.stub_argv.slice(0, 2), ["keyframe", fix.path]);
   });
@@ -137,7 +139,7 @@ describe("skill scripts: CLI resolution", () => {
     });
     const launcher = stubLauncher(tmp.dir, "capcut", stubCli(tmp.dir));
     const r = runKenBurns(fix.path, { CAPCUT_CLI: launcher }, copySkillOutside(tmp.dir));
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout.trim().split("\n").pop());
     assert.deepEqual(out.stub_argv.slice(0, 2), ["keyframe", fix.path]);
   });
@@ -153,7 +155,7 @@ describe("skill scripts: CLI resolution", () => {
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, "index.js"), readFileSync(stubCli(tmp.dir)));
     const r = runKenBurns(fix.path, envWithPath([]), copySkillOutside(tmp.dir));
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.status, 0, r.error?.message ?? `stderr: ${r.stderr}`);
     const out = JSON.parse(r.stdout.trim().split("\n").pop());
     assert.deepEqual(out.stub_argv.slice(0, 2), ["keyframe", fix.path]);
   });
